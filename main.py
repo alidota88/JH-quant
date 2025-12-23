@@ -1,65 +1,126 @@
 # main.py
+import os
 import time
+import json
 import schedule
+import requests
+import pandas as pd
 from datetime import datetime
-from database import init_db, check_data_count, get_data
+from database import init_db
+from db_manager import get_data, check_data_count
 from data_fetcher import backfill_data
-from strategies import STRATEGY_REGISTRY
-from notifier import send_message
-from config import ACTIVE_STRATEGIES, STRATEGY_CUSTOM_PARAMS
+from strategy import STRATEGY_REGISTRY
 
-def execute():
-    print(f"🔥 JH-quant 执行 - {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+TG_TOKEN = os.getenv("TG_TOKEN")
+TG_CHAT_ID = os.getenv("TG_CHAT_ID")
+
+# ==================== 配置 ====================
+# 激活的策略列表（逗号分隔），默认只跑标准版
+active_strategies = os.getenv("ACTIVE_STRATEGIES", "加权评分-极致缩量（标准）")
+active_strategies = [s.strip() for s in active_strategies.split(",") if s.strip()]
+
+# 自定义参数覆盖（JSON格式），例如：{"加权评分-极致缩量（标准）": {"min_score": 55}}
+custom_params_str = os.getenv("STRATEGY_PARAMS", "{}")
+try:
+    custom_params = json.loads(custom_params_str)
+except:
+    print("⚠️ STRATEGY_PARAMS 格式错误，已忽略")
+    custom_params = {}
+
+def send_telegram(message):
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return
     try:
-        backfill_data(200)
-    except Exception as e:
-        print(f"Backfill error: {e}")
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+        requests.post(url, json={"chat_id": TG_CHAT_ID, "text": message, "parse_mode": "Markdown"}, timeout=10)
+    except:
+        pass
 
-    if check_data_count() < 10000:
-        send_message("❌ 数据量不足，无法运行策略")
+def execute_logic(is_test=False):
+    print("------------------------------------------------")
+    print(f"🔥 [JH-quant] Starting... (Test: {is_test}) | 策略: {', '.join(active_strategies)}")
+    
+    # 数据补全
+    try:
+        backfill_data(lookback_days=200)
+    except Exception as e:
+        print(f"⚠️ Backfill interrupted: {e}")
+
+    row_count = check_data_count()
+    print(f"📉 Data rows: {row_count}")
+    if row_count < 10000:
+        send_telegram("❌ 数据量过少，无法运行策略")
         return
 
-    df = get_data(250)
+    df = get_data(n_days=250)
     date_str = datetime.now().strftime("%Y-%m-%d")
-    sent = 0
 
-    for name in ACTIVE_STRATEGIES:
-        if name not in STRATEGY_REGISTRY:
-            print(f"⚠️ 策略未注册: {name}")
+    sent_count = 0
+    for strategy_name in active_strategies:
+        if strategy_name not in STRATEGY_REGISTRY:
+            print(f"⚠️ 未找到策略: {strategy_name}")
             continue
 
-        entry = STRATEGY_REGISTRY[name]
-        params = entry['default_params'].copy()
-        if name in STRATEGY_CUSTOM_PARAMS:
-            params.update(STRATEGY_CUSTOM_PARAMS[name])
+        entry = STRATEGY_REGISTRY[strategy_name]
+        run_func = entry['func']
+        base_params = entry['default_params'].copy()
+        
+        # 环境变量参数覆盖
+        if strategy_name in custom_params:
+            base_params.update(custom_params[strategy_name])
 
-        print(f"🧠 运行 {name}")
-        results = entry['func'](df, params=params)
+        print(f"🧠 Running: {strategy_name} (params: {base_params.get('min_score', '?')}+)")
+        results = run_func(df, params=base_params)
 
         if results.empty:
-            send_message(f"📭 **{name}** ({date_str})\n\n今日无信号")
+            msg = f"📭 **{strategy_name}** ({date_str})\n\n今日无股票命中信号。"
+            send_telegram(msg)
+            print(f"   无结果")
             continue
 
         top = results.head(10)
-        lines = [f"🏆 **{name} TOP 10** ({date_str})", "---", f"入选：{len(results)}只\n"]
-        for i, (_, row) in enumerate(top.iterrows(), 1):
-            icon = ["🥇", "🥈", "🥉"][i-1] if i <= 3 else f"{i}."
-            lines.append(
+        msg_lines = [
+            f"🏆 **{strategy_name} TOP 10** ({date_str})",
+            "---",
+            f"📊 入选库：{len(results)} 只\n"
+        ]
+
+        for i, (_, row) in enumerate(top.iterrows()):
+            rank = i + 1
+            icon = "🥇" if i==0 else "🥈" if i==1 else "🥉" if i==2 else f"{rank}."
+            score = row.get('总分', 'N/A')
+            line = (
                 f"{icon} `{row['ts_code']}` 💰{row['close']:.2f}\n"
-                f"   **{row.get('总分', '?')}分** | {row.get('reason', '信号')}"
+                f"   **总分: {score}** | {row.get('reason', '信号命中')}\n"
             )
-        send_message("\n".join(lines))
-        sent += 1
+            msg_lines.append(line)
 
-    if sent == 0:
-        send_message(f"⚠️ 今日无任何策略信号 ({date_str})")
-    print("✅ 执行完成\n")
+        send_telegram("\n".join(msg_lines))
+        print(f"✅ {strategy_name}: 已推送 {len(top)} 只")
+        sent_count += 1
 
-if __name__ == "__main__":
-    print("🚀 JH-quant 启动")
+    if sent_count == 0:
+        send_telegram(f"⚠️ 今日所有策略均无信号 ({date_str})")
+    
+    print("------------------------------------------------")
+
+def main():
+    print("🚀 JH-quant System Starting...")
     init_db()
-    execute()  # 启动立即执行一次
-    schedule.every().day.at("08:30").do(execute)
+    
+    # 启动时立即运行一次
+    try:
+        execute_logic(is_test=True)
+    except Exception as e:
+        print(f"❌ Critical Error: {e}")
+        send_telegram(f"❌ JH-quant 启动报错: {e}")
+
+    # 每天 08:30 运行
+    schedule.every().day.at("08:30").do(execute_logic)
+    
     while True:
         schedule.run_pending()
         time.sleep(60)
+
+if __name__ == "__main__":
+    main()
